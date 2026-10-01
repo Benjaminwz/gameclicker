@@ -1,0 +1,23 @@
+name: statkit
+on:
+  push:
+    paths: ["statkit/**", ".github/workflows/statkit.yml"]
+  pull_request:
+    paths: ["statkit/**", ".github/workflows/statkit.yml"]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: statkit
+    strategy:
+      matrix:
+        python: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install -e ".[dev]"
+      - run: ruff check .
+      - run: pytest
