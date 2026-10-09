@@ -2,13 +2,17 @@
 
 桌面滑鼠連點器，附圖形介面與全域熱鍵，針對打遊戲加了不少功能。
 
-## 安裝與執行
+## 安裝（Windows）
+到 [Releases](https://github.com/Benjaminwz/gameclicker/releases) 下載 `GameClicker-Setup-Windows-版本.exe`，雙擊安裝，不用另外裝 Python，也不需要系統管理員權限。
+第一次執行時 Windows 可能跳出「不明發行者」的警告（安裝檔沒有付費簽章），選「其他資訊 → 仍要執行」即可。
+
+## 從原始碼執行（Windows / macOS / Linux）
 ```
 pip install -r requirements.txt
 python autoclicker.py
 ```
-（需要 Python 3.8+，Windows / macOS / Linux(X11)；macOS 需在「輔助使用」授權終端機。
-Windows 想不跳黑視窗，可用 `pythonw autoclicker.py` 或做成捷徑。）
+（需要 Python 3.8+；macOS 需在「輔助使用」授權終端機。Windows 想不跳黑視窗，可用 `pythonw autoclicker.py`。）
+自己打包安裝檔：`python installer/build.py v1.1.0`（需要 PyInstaller 和 Inno Setup 6）。
 
 ## 功能
 **基本**
@@ -23,6 +27,14 @@ Windows 想不跳黑視窗，可用 `pythonw autoclicker.py` 或做成捷徑。�
 - **熱鍵可自訂**，支援滑鼠側鍵；可選「按住熱鍵才連點」，放開就停
 - **遊戲相容模式**：用掃描碼送出按鍵，部分遊戲才收得到（Windows）
 - 按下持續時間可調（部分遊戲點太快會漏）、時間上限、開始 / 停止提示音（Windows）
+
+**輸入上限保護**
+- 間隔最低 2 毫秒（每秒約 500 次）：實測在 1 毫秒時連這台電腦也送不出 1000 次，設定值只是假的
+- 按下持續時間算在間隔裡（最多間隔的一半），所以實際速度會跟設定的一樣，不會比設定慢
+- 電腦忙到來不及時直接略過，不會事後一次補送一大串輸入
+- 前景視窗沒回應（遊戲讀檔、當掉）時自動暫停，好了再繼續，避免輸入在遊戲裡越積越多
+- 介面會顯示預計每秒幾次，並提醒間隔比螢幕每幀還短時，遊戲多半每幀只會算到 1 次
+- Windows 高 DPI（縮放 125%、175%）下畫面清楚，固定座標也不會錯位
 
 **預設熱鍵**：**F6** 開始/停止、**F7** 結束程式、**F8** 記錄座標、**F9** 記錄目前視窗標題
 

@@ -9,6 +9,7 @@
   - 遊戲相容模式：用掃描碼送出按鍵，部分遊戲才吃得到（Windows）
   - 設定檔：每個遊戲存一組設定
   - 固定座標點擊、啟動倒數、時間上限、提示音、即時統計（次數 / CPS）
+  - 輸入上限保護：間隔下限、按住時間算進間隔、落後不補點、遊戲沒回應時暫停
 
 需求：pip install pynput
 """
@@ -24,6 +25,7 @@ from tkinter import messagebox, ttk
 
 from pynput import keyboard, mouse
 
+VERSION = "1.1.0"
 IS_WINDOWS = sys.platform == "win32"
 
 BUTTONS = {"左鍵": mouse.Button.left, "右鍵": mouse.Button.right, "中鍵": mouse.Button.middle}
@@ -31,6 +33,7 @@ MODES = ["滑鼠", "鍵盤", "按住按鍵", "按住滑鼠"]
 KEY_MODES = ("鍵盤", "按住按鍵")
 HOLD_MODES = ("按住按鍵", "按住滑鼠")
 TRIGGERS = ["切換", "按住才連點"]
+MIN_INTERVAL = 2  # 毫秒。實測 1 毫秒也只送得出約 650 次/秒（程式與系統排程的極限），所以訂 2 毫秒當穩定上限
 SETTINGS_FILE = Path.home() / ".gameclicker.json"
 PROFILES_FILE = Path.home() / ".gameclicker_profiles.json"
 DEFAULTS = {
@@ -62,6 +65,15 @@ if IS_WINDOWS:
     user32.VkKeyScanW.restype = ctypes.c_short
     user32.GetForegroundWindow.restype = wintypes.HWND
     user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.IsHungAppWindow.argtypes = [wintypes.HWND]
+    user32.GetDC.restype = wintypes.HDC
+    user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
+    gdi32 = ctypes.windll.gdi32
+    gdi32.GetDeviceCaps.argtypes = [wintypes.HDC, ctypes.c_int]
+    try:  # 高 DPI：畫面不模糊，而且 pynput 的滑鼠座標才不會在縮放 125%、175% 時錯位
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except (AttributeError, OSError):
+        user32.SetProcessDPIAware()
 
     class _KI(ctypes.Structure):
         _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD), ("dwFlags", wintypes.DWORD),
@@ -105,6 +117,20 @@ if IS_WINDOWS:
         user32.GetWindowTextW(user32.GetForegroundWindow(), buf, 256)
         return buf.value
 
+    def foreground_hung():
+        """前景視窗是否沒回應（遊戲讀檔、當掉時）。"""
+        return bool(user32.IsHungAppWindow(user32.GetForegroundWindow()))
+
+    def refresh_rate():
+        dc = user32.GetDC(None)
+        hz = gdi32.GetDeviceCaps(dc, 116)  # VREFRESH
+        user32.ReleaseDC(None, dc)
+        return hz if hz > 1 else 60
+
+    def timer_resolution(on):
+        """把系統計時精度調到 1 毫秒，舊版 Python 的等待才不會一次差 15 毫秒。"""
+        (ctypes.windll.winmm.timeBeginPeriod if on else ctypes.windll.winmm.timeEndPeriod)(1)
+
     def beep(on):
         try:
             winsound.Beep(1400 if on else 800, 80)
@@ -116,6 +142,15 @@ else:
 
     def foreground_title():
         return None
+
+    def foreground_hung():
+        return False
+
+    def refresh_rate():
+        return 60
+
+    def timer_resolution(on):
+        pass
 
     def beep(on):
         pass
@@ -136,6 +171,18 @@ def parse_keys(text):
             return []
         keys.append(key)
     return keys
+
+
+def apply_limits(interval, hold):
+    """把間隔、按下持續時間限制在電腦與遊戲吃得下的範圍；回傳 (間隔, 按下持續, 說明)。"""
+    notes = []
+    if interval < MIN_INTERVAL:
+        interval = MIN_INTERVAL
+        notes.append(f"間隔已自動調為 {MIN_INTERVAL} 毫秒（電腦能穩定送出的上限）")
+    if hold > interval // 2:
+        hold = interval // 2
+        notes.append(f"按下持續已縮短為 {hold} 毫秒（按住時間算在間隔裡，最多一半）")
+    return interval, hold, notes
 
 
 def key_name(key):
@@ -175,16 +222,20 @@ class AutoClicker:
         self.mouse = mouse.Controller()
         self.kb = keyboard.Controller()
         self.running = False
-        self.paused = False  # 目前視窗不是指定的遊戲視窗
+        self.paused = ""  # 暫停原因：""=正常、"window"=不是指定視窗、"hung"=前景視窗沒回應
         self.clicks = 0
         self.started_at = 0.0
         self.thread = None
+        self._gate_at = 0.0
+        self._hung_at = 0.0
+        self._hung = False
 
     def start(self, cfg):
         if self.running:
             return
         self.running = True
-        self.paused = False
+        self.paused = ""
+        self._gate_at = self._hung_at = 0.0
         self.clicks = 0
         self.started_at = 0.0
         self.thread = threading.Thread(target=self._loop, args=(cfg,), daemon=True)
@@ -193,14 +244,31 @@ class AutoClicker:
     def stop(self):
         self.running = False
 
-    def _sleep(self, ms):
-        end = time.perf_counter() + ms / 1000
-        while self.running and time.perf_counter() < end:
-            time.sleep(min(0.005, max(0, end - time.perf_counter())))
+    def _wait_until(self, t):
+        """等到時間 t（perf_counter）；最後 3 毫秒只讓出時間片不睡死，才準。"""
+        while self.running:
+            left = t - time.perf_counter()
+            if left <= 0:
+                return
+            time.sleep(min(0.005, left - 0.003) if left > 0.003 else 0)
 
-    def _blocked(self, cfg):
-        title = foreground_title() if cfg["window"] else None
-        return title is not None and cfg["window"] not in title.lower()
+    def _sleep(self, ms):
+        self._wait_until(time.perf_counter() + ms / 1000)
+
+    def _gate(self, cfg):
+        """該不該暫停（每 50 毫秒才查一次）。視窗沒回應時再送輸入只會在它的佇列裡越積越多。"""
+        now = time.perf_counter()
+        if now < self._gate_at:
+            return self.paused
+        self._gate_at = now + 0.05
+        if cfg["window"]:
+            title = foreground_title()
+            if title is not None and cfg["window"] not in title.lower():
+                return "window"
+        if now >= self._hung_at:
+            self._hung_at = now + 0.25
+            self._hung = foreground_hung()
+        return "hung" if self._hung else ""
 
     def _key(self, cfg, key, down):
         if cfg["compat"] and send_scan_key(key, down):
@@ -253,10 +321,11 @@ class AutoClicker:
             end = self.started_at + cfg["limit"] * 60 if cfg["limit"] else None
             hold_mode = cfg["mode"] in HOLD_MODES
             step = 0
+            next_t = time.perf_counter()
             while self.running:
                 if end and time.perf_counter() >= end:
                     break
-                self.paused = self._blocked(cfg)
+                self.paused = self._gate(cfg)
                 if hold_mode:
                     if self.paused and held:
                         self._release(cfg, held)
@@ -266,17 +335,22 @@ class AutoClicker:
                     continue
                 if self.paused:
                     self._sleep(100)
+                    next_t = time.perf_counter()
                     continue
                 self._click(cfg, step)
                 step += 1
                 self.clicks += 1
                 if cfg["count"] and self.clicks >= cfg["count"]:
                     break
-                self._sleep(max(1, cfg["interval"] + random.uniform(-cfg["jitter"], cfg["jitter"])))
+                gap = max(MIN_INTERVAL, cfg["interval"] + random.uniform(-cfg["jitter"], cfg["jitter"])) / 1000
+                next_t += gap  # 用絕對時間排程，速度才不會被每次點擊的耗時拖慢
+                if time.perf_counter() - next_t > 2 * gap:
+                    next_t = time.perf_counter()  # 落後太多（電腦忙）就放棄補點，免得一次湧出一大串輸入
+                self._wait_until(next_t)
         finally:
             self._release(cfg, held)
             self.running = False
-            self.paused = False
+            self.paused = ""
 
 
 # ---------------------------------------------------------------- 介面
@@ -300,7 +374,13 @@ class Grid:
 class App:
     def __init__(self, root):
         self.root = root
-        root.title("遊戲連點器")
+        root.title(f"遊戲連點器 v{VERSION}")
+        ico = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "gameclicker.ico"
+        if IS_WINDOWS and ico.exists():
+            try:
+                root.iconbitmap(default=str(ico))
+            except tk.TclError:
+                pass
         root.resizable(False, False)
         root.attributes("-topmost", True)
         self.clicker = AutoClicker()
@@ -353,6 +433,8 @@ class App:
         g.add("滑鼠按鍵", ttk.Combobox(basic, values=list(BUTTONS), textvariable=self.v["button"], width=10, state="readonly"))
         g.add("鍵盤按鍵", ttk.Entry(basic, textvariable=self.v["key"], width=13))
         g.add(None, ttk.Label(basic, text="連點時可用逗號輪流按，如 1,2,e；按住時會同時按住", foreground="gray"))
+        self.info = ttk.Label(basic, foreground="gray", wraplength=int(root.winfo_fpixels("3.1i")), justify="left")
+        g.add(None, self.info)
         g.add(None, ttk.Checkbutton(basic, text="雙擊", variable=self.v["double"]))
         g.add(None, ttk.Checkbutton(basic, text="固定座標 (按記錄座標熱鍵設定)", variable=self.v["use_pos"]))
         pos = ttk.Frame(basic)
@@ -394,6 +476,11 @@ class App:
         for key in [k for k, _ in HOTKEYS] + ["trigger"]:
             self.v[key].trace_add("write", self._sync_hotkeys)
         self._sync_hotkeys()
+        self.frame_ms = 1000 / refresh_rate()
+        for key in ("interval", "hold"):
+            self.v[key].trace_add("write", self._update_info)
+        self._update_info()
+        timer_resolution(True)
         root.protocol("WM_DELETE_WINDOW", self.quit)
         self._tick()
 
@@ -423,6 +510,13 @@ class App:
     def _on_click(self, _x, _y, button, pressed):
         if button.name in ("x1", "x2"):  # 注意：回傳 False 會讓監聽停掉，所以這裡不回傳值
             self._input(button.name, pressed)
+
+    def _update_info(self, *_):
+        interval, _hold, notes = apply_limits(self._int(self.v["interval"], 100, 1), self._int(self.v["hold"], 20))
+        lines = [f"預計每秒約 {1000 / interval:.0f} 次（螢幕每幀 {self.frame_ms:.1f} 毫秒）"]
+        if interval < self.frame_ms:
+            lines.append("提醒：比螢幕每幀還快，遊戲多半每幀只會算到 1 次")
+        self.info.config(text=chr(10).join(lines + notes))
 
     def capture(self, key):
         for b in self.cap_btns.values():
@@ -512,13 +606,14 @@ class App:
             self._say("無效的鍵盤按鍵", "red")
             return None
         x, y = self._int(self.v["x"], 0), self._int(self.v["y"], 0)
+        interval, hold, _ = apply_limits(self._int(self.v["interval"], 100, 1), self._int(self.v["hold"], 20))
         return {
             "mode": mode,
-            "interval": self._int(self.v["interval"], 100, 1),
+            "interval": interval,
             "jitter": self._int(self.v["jitter"], 0),
             "count": self._int(self.v["count"], 0),
             "delay": self._int(self.v["delay"], 0),
-            "hold": self._int(self.v["hold"], 20),
+            "hold": hold,
             "limit": self._int(self.v["limit"], 0),
             "window": self.v["window"].get().strip().lower(),
             "compat": self.v["compat"].get(),
@@ -580,6 +675,8 @@ class App:
             if not (c.started_at and time.perf_counter() >= c.started_at):
                 left = max(0, self.delay_until - time.perf_counter())
                 self._say(f"{left:.1f} 秒後開始…", "orange")
+            elif c.paused == "hung":
+                self._say("暫停中：遊戲視窗沒有回應（讀檔中？），好了會自動繼續", "orange")
             elif c.paused:
                 self._say(f"暫停中：目前視窗不是「{self.v['window'].get().strip()[:16]}」", "orange")
             elif self.hold_mode:
@@ -599,6 +696,7 @@ class App:
         self.kl.stop()
         if self.ml:
             self.ml.stop()
+        timer_resolution(False)
         self.save()
         self.root.destroy()
 
